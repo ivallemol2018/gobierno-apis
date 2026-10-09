@@ -1,0 +1,213 @@
+name: Verificación semántica de contratos
+description: >
+  Revisa con Copilot CLI la semántica (BIAN + ISO 20022) de los contratos OpenAPI y
+  AsyncAPI modificados en un Pull Request, comenta el resultado y falla si hay hallazgos
+  al nivel configurado. Reglas, glosario y prompt viajan con la action (versionados).
+
+inputs:
+  copilot-token:
+    description: Fine-grained PAT con el permiso "Copilot Requests" (secret COPILOT_CLI_TOKEN).
+    required: false
+    default: ''
+  github-token:
+    description: Token para comentar en el PR.
+    required: false
+    default: ${{ github.token }}
+  nivel-fallo:
+    description: Severidad mínima que hace fallar el check (BLOQUEANTE o MEJORA).
+    required: false
+    default: BLOQUEANTE
+  patron-contratos:
+    description: Regex extendida sobre la ruta que identifica un contrato.
+    required: false
+    default: '^api/[^/]+\.(ya?ml|json)$'
+  patron-async:
+    description: Regex extendida sobre la ruta que identifica un contrato asíncrono; el resto es síncrono.
+    required: false
+    default: '^api/asyncapi[^/]*$'
+  modelo:
+    description: Modelo de Copilot CLI (vacío = el predeterminado).
+    required: false
+    default: ''
+  base-sha:
+    description: Commit base del PR.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  head-sha:
+    description: Commit head del PR.
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+
+outputs:
+  resultado:
+    description: sin-contratos | aprobado | hallazgos | sin-reporte
+    value: ${{ steps.resultado.outputs.resultado }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detectar contratos modificados
+      id: contratos
+      shell: bash
+      env:
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        PATRON_CONTRATOS: ${{ inputs.patron-contratos }}
+        PATRON_ASYNC: ${{ inputs.patron-async }}
+      run: |
+        TRABAJO="$RUNNER_TEMP/verificacion-semantica"
+        mkdir -p "$TRABAJO"
+        echo "trabajo=$TRABAJO" >> "$GITHUB_OUTPUT"
+
+        if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+          echo "::error::No hay base/head del PR. Esta action solo funciona en eventos pull_request."
+          echo "hay=error" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git diff --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" \
+          | grep -E "$PATRON_CONTRATOS" > "$TRABAJO/archivos.txt" || true
+
+        # Async si el nombre empieza con `asyncapi`; si no, sync.
+        : > "$TRABAJO/contratos.txt"
+        while IFS= read -r archivo; do
+          if [[ "$archivo" =~ $PATRON_ASYNC ]]; then
+            echo "$archivo (ASYNC → reglas AsyncAPI)" >> "$TRABAJO/contratos.txt"
+          else
+            echo "$archivo (SYNC → reglas OpenAPI)" >> "$TRABAJO/contratos.txt"
+          fi
+        done < "$TRABAJO/archivos.txt"
+
+        if [ -s "$TRABAJO/contratos.txt" ]; then
+          echo "hay=true" >> "$GITHUB_OUTPUT"
+          echo "Contratos a verificar:"; cat "$TRABAJO/contratos.txt"
+        else
+          echo "hay=false" >> "$GITHUB_OUTPUT"
+          echo "El PR no modifica contratos en api/. Nada que verificar." | tee -a "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Configurar Node.js
+      if: steps.contratos.outputs.hay == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Instalar Copilot CLI
+      if: steps.contratos.outputs.hay == 'true'
+      shell: bash
+      run: npm install -g @github/copilot
+
+    - name: Ejecutar verificación semántica con Copilot CLI
+      if: steps.contratos.outputs.hay == 'true'
+      shell: bash
+      env:
+        COPILOT_GITHUB_TOKEN: ${{ inputs.copilot-token }}
+        COPILOT_MODEL: ${{ inputs.modelo }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+        REPORTE: reporte-semantico.json
+      run: |
+        if [ -z "$COPILOT_GITHUB_TOKEN" ]; then
+          echo "::error::Falta el token de Copilot. Crea el secret de organización COPILOT_CLI_TOKEN con acceso a este repositorio y llama al workflow con 'secrets: inherit'. En PRs desde forks los secrets no están disponibles."
+          exit 0   # el paso de evaluación falla de forma controlada (sin reporte)
+        fi
+        copilot --version || true
+
+        # Prompt = plantilla + contratos + reglas + glosario (todo viaja con la action).
+        CONTRATOS="$(sed 's/^/- /' "$TRABAJO/contratos.txt")"
+        PROMPT="$(cat "$GITHUB_ACTION_PATH/prompt.md")"
+        PROMPT="${PROMPT//\$BASE_SHA/"$BASE_SHA"}"
+        PROMPT="${PROMPT//\$HEAD_SHA/"$HEAD_SHA"}"
+        PROMPT="${PROMPT//\$CONTRATOS/"$CONTRATOS"}"
+        PROMPT="${PROMPT//\$REPORTE/"$REPORTE"}"
+        # Los textos largos se insertan al final para que su contenido no se vuelva a sustituir.
+        PROMPT="${PROMPT//\$REGLAS_OPENAPI/"$(cat "$GITHUB_ACTION_PATH/reglas/openapi-semantica.md")"}"
+        PROMPT="${PROMPT//\$REGLAS_ASYNCAPI/"$(cat "$GITHUB_ACTION_PATH/reglas/asyncapi-semantica.md")"}"
+        PROMPT="${PROMPT//\$GLOSARIO/"$(cat "$GITHUB_ACTION_PATH/glosario.md")"}"
+
+        MODELO_ARGS=()
+        if [ -n "$COPILOT_MODEL" ]; then MODELO_ARGS=(--model "$COPILOT_MODEL"); fi
+
+        # Herramientas mínimas: leer, ver diff/historial y escribir SOLO el reporte.
+        set +e
+        copilot -p "$PROMPT" -s --no-ask-user "${MODELO_ARGS[@]}" \
+          --allow-tool="read, shell(git diff:*), shell(git show:*), shell(cat:*), write($REPORTE)" \
+          --share="$TRABAJO/copilot-sesion.md" \
+          > "$TRABAJO/copilot-salida.log" 2>&1
+        CODIGO_COPILOT=$?
+        set -e
+
+        echo "Código de salida de Copilot CLI: $CODIGO_COPILOT"
+        echo "----- Últimas 60 líneas de la salida de Copilot CLI -----"
+        tail -n 60 "$TRABAJO/copilot-salida.log"
+        if [ "$CODIGO_COPILOT" -ne 0 ]; then
+          echo "::warning::Copilot CLI terminó con código $CODIGO_COPILOT. Revisa la salida arriba (autenticación, permisos del token, licencia, modelo)."
+        fi
+
+    - name: Evaluar reporte
+      id: evaluar
+      if: steps.contratos.outputs.hay == 'true'
+      shell: bash
+      env:
+        NIVEL_FALLO: ${{ inputs.nivel-fallo }}
+        TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+      run: |
+        set +e
+        # Si Copilot no escribió el archivo, se intenta recuperar el JSON de su respuesta.
+        python3 "$GITHUB_ACTION_PATH/evaluar_reporte.py" reporte-semantico.json \
+          "$TRABAJO/resumen.md" "$NIVEL_FALLO" "$TRABAJO/copilot-salida.log"
+        echo "codigo=$?" >> "$GITHUB_OUTPUT"
+        cat "$TRABAJO/resumen.md" >> "$GITHUB_STEP_SUMMARY"
+        # El reporte queda fuera del repo para no ensuciar el workspace.
+        mv reporte-semantico.json "$TRABAJO/" 2>/dev/null || true
+
+    - name: Publicar resultado en el PR
+      if: steps.evaluar.outputs.codigo != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+      run: |
+        MARCA='<!-- verificacion-semantica -->'
+        printf '%s\n%s\n' "$MARCA" "$(cat "$TRABAJO/resumen.md")" > "$TRABAJO/comentario.md"
+
+        ID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+               --jq ".[] | select(.body | startswith(\"$MARCA\")) | .id" | tail -n1) || ID=""
+
+        if [ -n "$ID" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$ID" -F body=@"$TRABAJO/comentario.md" > /dev/null \
+            || echo "::warning::No se pudo actualizar el comentario del PR (¿falta permiso pull-requests: write?)."
+        else
+          gh api "repos/$REPO/issues/$PR/comments" -F body=@"$TRABAJO/comentario.md" > /dev/null \
+            || echo "::warning::No se pudo comentar en el PR (¿falta permiso pull-requests: write?)."
+        fi
+
+    - name: Guardar evidencia
+      if: steps.evaluar.outputs.codigo != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: verificacion-semantica
+        path: ${{ steps.contratos.outputs.trabajo }}
+        if-no-files-found: ignore
+
+    - name: Resultado del check
+      id: resultado
+      shell: bash
+      env:
+        HAY: ${{ steps.contratos.outputs.hay }}
+        CODIGO: ${{ steps.evaluar.outputs.codigo }}
+        NIVEL_FALLO: ${{ inputs.nivel-fallo }}
+      run: |
+        if [ "$HAY" = "false" ]; then echo "resultado=sin-contratos" >> "$GITHUB_OUTPUT"; exit 0; fi
+        if [ "$HAY" = "error" ]; then echo "resultado=sin-reporte" >> "$GITHUB_OUTPUT"; exit 1; fi
+        case "$CODIGO" in
+          0) echo "resultado=aprobado" >> "$GITHUB_OUTPUT"
+             echo "Verificación semántica aprobada." ;;
+          1) echo "resultado=hallazgos" >> "$GITHUB_OUTPUT"
+             echo "::error::Hay hallazgos de severidad $NIVEL_FALLO o superior. Revisa el comentario del PR."; exit 1 ;;
+          *) echo "resultado=sin-reporte" >> "$GITHUB_OUTPUT"
+             echo "::error::No se obtuvo un reporte válido de Copilot CLI (fail-closed)."; exit 1 ;;
+        esac

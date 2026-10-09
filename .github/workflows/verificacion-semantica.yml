@@ -1,0 +1,73 @@
+name: Verificación semántica (reusable)
+
+# Reusable workflow que llaman los repositorios de contratos creados desde el template.
+# Toda la lógica, las reglas y el glosario viven en actions/verificacion-semantica
+# y se versionan junto con este workflow (tags v1.x.y y tag mayor móvil v1).
+#
+# IMPORTANTE: reemplaza MI-ORG por el nombre de tu organización y mantén el tag
+# de la action igual al tag con el que se publica este workflow.
+
+on:
+  workflow_call:
+    inputs:
+      nivel-fallo:
+        description: Severidad mínima que hace fallar el check (BLOQUEANTE o MEJORA).
+        type: string
+        required: false
+        default: BLOQUEANTE
+      patron-contratos:
+        description: Regex sobre la ruta que identifica un contrato.
+        type: string
+        required: false
+        default: '^api/[^/]+\.(ya?ml|json)$'
+      patron-async:
+        description: Regex sobre la ruta que identifica un contrato asíncrono.
+        type: string
+        required: false
+        default: '^api/asyncapi[^/]*$'
+      modelo:
+        description: Modelo de Copilot CLI (vacío = el predeterminado).
+        type: string
+        required: false
+        default: ''
+    secrets:
+      COPILOT_CLI_TOKEN:
+        description: Fine-grained PAT con el permiso "Copilot Requests" (secret de organización).
+        required: false
+    outputs:
+      resultado:
+        description: sin-contratos | aprobado | hallazgos | sin-reporte
+        value: ${{ jobs.verificacion-semantica.outputs.resultado }}
+
+jobs:
+  verificacion-semantica:
+    name: Verificación semántica
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: verificacion-semantica-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    outputs:
+      resultado: ${{ steps.verificacion.outputs.resultado }}
+
+    steps:
+      - name: Checkout del repositorio de contratos
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # El agente puede ejecutar git: no dejamos credenciales en el repo local.
+          persist-credentials: false
+
+      - name: Verificación semántica
+        id: verificacion
+        uses: MI-ORG/gobierno-apis/actions/verificacion-semantica@v1
+        with:
+          copilot-token: ${{ secrets.COPILOT_CLI_TOKEN }}
+          nivel-fallo: ${{ inputs.nivel-fallo }}
+          patron-contratos: ${{ inputs.patron-contratos }}
+          patron-async: ${{ inputs.patron-async }}
+          modelo: ${{ inputs.modelo }}
