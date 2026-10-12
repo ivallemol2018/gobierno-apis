@@ -82,7 +82,7 @@ jobs:
 
       - name: Verificación semántica
         id: verificacion
-        uses: MI-ORG/gobierno-apis/actions/verificacion-semantica@v2
+        uses: ivallemol2018/gobierno-apis/actions/verificacion-semantica@v1
         with:
           copilot-token: ${{ secrets.COPILOT_CLI_TOKEN }}
           nivel-fallo: ${{ inputs.nivel-fallo }}
