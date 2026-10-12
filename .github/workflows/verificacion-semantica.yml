@@ -2,7 +2,7 @@ name: Verificación semántica (reusable)
 
 # Reusable workflow que llaman los repositorios de contratos creados desde el template.
 # Toda la lógica, las reglas y el glosario viven en actions/verificacion-semantica
-# y se versionan junto con este workflow (tags v1.x.y y tag mayor móvil v1).
+# y se versionan junto con este workflow (tags v2.x.y y tag mayor móvil v2).
 #
 # IMPORTANTE: reemplaza MI-ORG por el nombre de tu organización y mantén el tag
 # de la action igual al tag con el que se publica este workflow.
@@ -30,9 +30,27 @@ on:
         type: string
         required: false
         default: ''
+      plantillas-repo-patron:
+        description: Repositorio de la plantilla BIAN; {service-domain} = Service Domain del título en kebab-case.
+        type: string
+        required: false
+        default: bcp-api-template-{service-domain}
+      plantillas-archivo-patron:
+        description: Regex del archivo de plantilla dentro de api/.
+        type: string
+        required: false
+        default: '^business-{service-domain}-.+\.(ya?ml|json)$'
+      plantillas-ref:
+        description: Rama o tag de los repositorios de plantilla (vacío = rama por defecto).
+        type: string
+        required: false
+        default: ''
     secrets:
       COPILOT_CLI_TOKEN:
         description: Fine-grained PAT con el permiso "Copilot Requests" (secret de organización).
+        required: false
+      BIAN_TEMPLATE_TOKEN:
+        description: Token con lectura de los repositorios de plantillas BIAN (secret de organización).
         required: false
     outputs:
       resultado:
@@ -64,10 +82,14 @@ jobs:
 
       - name: Verificación semántica
         id: verificacion
-        uses: ivallemol2018/gobierno-apis/actions/verificacion-semantica@v1
+        uses: MI-ORG/gobierno-apis/actions/verificacion-semantica@v2
         with:
           copilot-token: ${{ secrets.COPILOT_CLI_TOKEN }}
           nivel-fallo: ${{ inputs.nivel-fallo }}
           patron-contratos: ${{ inputs.patron-contratos }}
           patron-async: ${{ inputs.patron-async }}
           modelo: ${{ inputs.modelo }}
+          plantillas-token: ${{ secrets.BIAN_TEMPLATE_TOKEN }}
+          plantillas-repo-patron: ${{ inputs.plantillas-repo-patron }}
+          plantillas-archivo-patron: ${{ inputs.plantillas-archivo-patron }}
+          plantillas-ref: ${{ inputs.plantillas-ref }}

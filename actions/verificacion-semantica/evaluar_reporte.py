@@ -17,6 +17,7 @@ ningún resumen que el modelo pudiera escribir.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -127,6 +128,19 @@ def main() -> int:
             encoding="utf-8",
         )
         return 2
+
+    # Hallazgos deterministas (p. ej. plantilla BIAN inexistente) calculados antes de Copilot.
+    previos = os.environ.get("HALLAZGOS_PREVIOS", "")
+    if previos and Path(previos).is_file():
+        try:
+            extra = json.loads(Path(previos).read_text(encoding="utf-8")).get("hallazgos", [])
+        except (ValueError, AttributeError):
+            extra = []
+        for h in extra:
+            sev = str(h.get("severidad", "")).strip().upper() if isinstance(h, dict) else ""
+            if sev in SEVERIDADES and h.get("archivo") and h.get("mensaje"):
+                h["severidad"] = sev
+                hallazgos.append(h)
 
     hallazgos.sort(key=lambda h: (-RANGO[h["severidad"]], str(h["archivo"]), h.get("linea") or 0))
     n_bloq = sum(h["severidad"] == "BLOQUEANTE" for h in hallazgos)

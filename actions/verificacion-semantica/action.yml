@@ -29,6 +29,30 @@ inputs:
     description: Modelo de Copilot CLI (vacío = el predeterminado).
     required: false
     default: ''
+  plantillas-token:
+    description: Token con lectura (Contents read) de los repositorios de plantillas BIAN (secret BIAN_TEMPLATE_TOKEN).
+    required: false
+    default: ''
+  plantillas-organizacion:
+    description: Organización donde están los repositorios de plantillas BIAN.
+    required: false
+    default: ${{ github.repository_owner }}
+  plantillas-repo-patron:
+    description: Nombre del repositorio de la plantilla; {service-domain} = Service Domain del título en kebab-case.
+    required: false
+    default: bcp-api-template-{service-domain}
+  plantillas-carpeta:
+    description: Carpeta del repositorio de plantilla donde está la especificación.
+    required: false
+    default: api
+  plantillas-archivo-patron:
+    description: Regex del nombre del archivo de plantilla; {service-domain} = Service Domain en kebab-case.
+    required: false
+    default: '^business-{service-domain}-.+\.(ya?ml|json)$'
+  plantillas-ref:
+    description: Rama o tag de los repositorios de plantilla (vacío = rama por defecto).
+    required: false
+    default: ''
   base-sha:
     description: Commit base del PR.
     required: false
@@ -86,6 +110,40 @@ runs:
           echo "El PR no modifica contratos en api/. Nada que verificar." | tee -a "$GITHUB_STEP_SUMMARY"
         fi
 
+    - name: Resolver plantillas BIAN
+      id: plantillas
+      if: steps.contratos.outputs.hay == 'true'
+      shell: bash
+      env:
+        PLANTILLAS_TOKEN: ${{ inputs.plantillas-token }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+        ORG: ${{ inputs.plantillas-organizacion }}
+        REPO_PATRON: ${{ inputs.plantillas-repo-patron }}
+        CARPETA: ${{ inputs.plantillas-carpeta }}
+        ARCHIVO_PATRON: ${{ inputs.plantillas-archivo-patron }}
+        REF: ${{ inputs.plantillas-ref }}
+      run: |
+        # PyYAML viene en los runners ubuntu; si falta, se instala (sin él solo se pierde
+        # el cálculo de endpoints modificados, que Copilot deduce del diff).
+        python3 -c 'import yaml' 2>/dev/null \
+          || python3 -m pip install --quiet --break-system-packages pyyaml 2>/dev/null \
+          || python3 -m pip install --quiet --user pyyaml 2>/dev/null \
+          || echo "::warning::PyYAML no disponible: no se calcularán los endpoints modificados."
+
+        DIR="$TRABAJO/plantillas"
+        mkdir -p "$DIR"
+        echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+        if ! python3 "$GITHUB_ACTION_PATH/resolver_plantillas.py" \
+          --contratos "$TRABAJO/contratos.txt" --base "$BASE_SHA" --salida-dir "$DIR" \
+          --org "$ORG" --repo-patron "$REPO_PATRON" --carpeta "$CARPETA" \
+          --archivo-patron "$ARCHIVO_PATRON" --ref "$REF"; then
+          # Fail-closed: si el resolver falla, no se omite la comparación en silencio.
+          echo "::error::Falló la resolución de plantillas BIAN. Revisa la salida de este paso."
+          printf '%s\n' '{"hallazgos":[{"severidad":"BLOQUEANTE","archivo":"api","linea":null,"ubicacion":"","regla":"configuracion-plantilla","mensaje":"Falló la resolución de plantillas BIAN; es un problema del check, no del contrato.","sugerencia":"Gobierno de APIs: revisa el log del paso Resolver plantillas BIAN."}]}' \
+            > "$DIR/hallazgos-previos.json"
+        fi
+
     - name: Configurar Node.js
       if: steps.contratos.outputs.hay == 'true'
       uses: actions/setup-node@v4
@@ -106,6 +164,7 @@ runs:
         BASE_SHA: ${{ inputs.base-sha }}
         HEAD_SHA: ${{ inputs.head-sha }}
         TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+        PLANTILLAS_DIR: ${{ steps.plantillas.outputs.dir }}
         REPORTE: reporte-semantico.json
       run: |
         if [ -z "$COPILOT_GITHUB_TOKEN" ]; then
@@ -121,6 +180,9 @@ runs:
         PROMPT="${PROMPT//\$HEAD_SHA/"$HEAD_SHA"}"
         PROMPT="${PROMPT//\$CONTRATOS/"$CONTRATOS"}"
         PROMPT="${PROMPT//\$REPORTE/"$REPORTE"}"
+        PLANTILLAS="Ningún contrato SYNC de este PR requiere comparación con plantilla BIAN: no apliques la regla 8."
+        if [ -f "$PLANTILLAS_DIR/contexto.md" ]; then PLANTILLAS="$(cat "$PLANTILLAS_DIR/contexto.md")"; fi
+        PROMPT="${PROMPT//\$PLANTILLAS/"$PLANTILLAS"}"
         # Los textos largos se insertan al final para que su contenido no se vuelva a sustituir.
         PROMPT="${PROMPT//\$REGLAS_OPENAPI/"$(cat "$GITHUB_ACTION_PATH/reglas/openapi-semantica.md")"}"
         PROMPT="${PROMPT//\$REGLAS_ASYNCAPI/"$(cat "$GITHUB_ACTION_PATH/reglas/asyncapi-semantica.md")"}"
@@ -128,10 +190,13 @@ runs:
 
         MODELO_ARGS=()
         if [ -n "$COPILOT_MODEL" ]; then MODELO_ARGS=(--model "$COPILOT_MODEL"); fi
+        # Las plantillas descargadas están fuera del repo: se autoriza su lectura.
+        DIR_ARGS=()
+        if [ -d "$PLANTILLAS_DIR/archivos" ]; then DIR_ARGS=(--add-dir "$PLANTILLAS_DIR/archivos"); fi
 
         # Herramientas mínimas: leer, ver diff/historial y escribir SOLO el reporte.
         set +e
-        copilot -p "$PROMPT" -s --no-ask-user "${MODELO_ARGS[@]}" \
+        copilot -p "$PROMPT" -s --no-ask-user "${MODELO_ARGS[@]}" "${DIR_ARGS[@]}" \
           --allow-tool="read, shell(git diff:*), shell(git show:*), shell(cat:*), write($REPORTE)" \
           --share="$TRABAJO/copilot-sesion.md" \
           > "$TRABAJO/copilot-salida.log" 2>&1
@@ -152,6 +217,7 @@ runs:
       env:
         NIVEL_FALLO: ${{ inputs.nivel-fallo }}
         TRABAJO: ${{ steps.contratos.outputs.trabajo }}
+        HALLAZGOS_PREVIOS: ${{ steps.plantillas.outputs.dir }}/hallazgos-previos.json
       run: |
         set +e
         # Si Copilot no escribió el archivo, se intenta recuperar el JSON de su respuesta.

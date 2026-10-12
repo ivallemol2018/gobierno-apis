@@ -59,6 +59,8 @@ Cada API corresponde a **un** Service Domain. El base path es el Service Domain 
 
 Nunca el action term como verbo en la ruta (`/payment-execution-transactions/{id}/Execute`).
 
+**Excepción — contratos con plantilla BIAN** (título `API BS <ServiceDomainBian> <DominioFederado> V<n>`): la ruta sigue a la plantilla del Service Domain, que usa recursos en kebab-case plural y el action term como último segmento en kebab-case (`POST /customer-offer-procedures/{customerOfferProcedureId}/initiate`). En ese caso el verbo HTTP es el de la plantilla y la tabla anterior no se aplica.
+
 ---
 
 ## 3. Términos de negocio
